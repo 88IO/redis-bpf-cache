@@ -15,10 +15,10 @@
 #define MAX_KEY_LENGTH 256
 #define MAX_CACHE_DATA_SIZE 1024
 #define MAX_PACKET_LENGTH 1518
+#define MAX_L4_CSUM_LOOP 742
 #define RECURSION_UPPER_LIMIT 33
 #define CACHE_QUEUE_SIZE 512
 #define CACHE_ENTRY_COUNT 1024
-
 #define MAX_STRINT_SIZE 4
 
 #define FNV_OFFSET_BASIS_32 2166136261
@@ -28,37 +28,12 @@
     if (target + 1 > end) \
         return -EACCES;
 
-#define assert_bound_pass(target, end) \
-    if (target + 1 > end) \
-        return XDP_PASS;
-
-// enum {
-//     XDP_RX_FILTER = 0,
-//     XDP_HASH,
-// };
-// struct {
-//     __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-// 	   __type(key, int);
-// 	   __type(value, int);
-// 	   __uint(max_entries, RECURSION_UPPER_LIMIT);
-// } map_xdp_progs SEC(".maps");
-
-// enum {
-// 	PARSING_INGRESS = 0,
-// 	PARSING_EGRESS,
-// 	PARSING_MAX,
-// };
-// struct parsing_context {
-//     __u32 key_hash;
-//     unsigned int key_len;
-//     unsigned int key_offset;
-// };
-// struct {
-//     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-// 	__type(key, int);
-// 	__type(value, struct parsing_context);
-// 	__uint(max_entries, PARSING_MAX);
-// } map_parsing_context SEC(".maps");
+#define DEBUG_BUILD
+#ifdef DEBUG_BUILD
+# define DEBUG_PRINTK(fmt, ...)  bpf_printk(fmt, ## __VA_ARGS__);                   
+#else
+# define DEBUG_PRINTK(fmt, ...)
+#endif
 
 struct cache_entry {
 	struct bpf_spin_lock lock;
@@ -91,14 +66,6 @@ struct {
 
 struct hdr_cursor {
 	void *pos;
-};
-
-struct pseudo_ip {
-    __u32  saddr;
-    __u32  daddr;
-    __u8   dummy;
-    __u8   protocol;
-    __be16 ip_len;
 };
 
 enum method {
@@ -154,59 +121,25 @@ static __always_inline int calc_key_hash(struct hdr_cursor *nh,
 static __always_inline enum method determine_method(struct hdr_cursor *nh,
                         void *data_end) 
 {
+    DEBUG_PRINTK("%u, %u\n", nh->pos, data_end);
     if (nh->pos + 11 > data_end)
         return (enum method)NONE;
     
     char *c = nh->pos;
 
+    DEBUG_PRINTK("%c\n", c[5]);
+    DEBUG_PRINTK("%c, %c, %c\n", c[8], c[9], c[10]);
+
     if (c[5] != '3')
         return (enum method)NONE;
 
-    if (c[8] == 'g' && c[9] == 'e' && c[10] == 't')
+    if (c[8] == 'G' && c[9] == 'E' && c[10] == 'T')
         return (enum method)GET;
-    if (c[8] == 's' && c[9] == 'e' && c[10] == 't')
+    if (c[8] == 'S' && c[9] == 'E' && c[10] == 'T')
         return (enum method)SET;
     
     return (enum method)NONE;
 }
-
-// static __always_inline int parse_elem(struct hdr_cursor *nh, 
-//                         void *data_end,
-//                         struct elem_str *e) 
-// {
-//     assert_bound_err(nh->pos, data_end);
-//     if (*(char*)nh->pos++ != '$') 
-//         return -EFAULT;
-    
-//     assert_bound_err(nh->pos, data_end);
-//     bpf_printk("now: %c\n", *(char*)nh->pos);
-//     if (strtoi(nh, data_end, &e->len)) 
-//         return -EFAULT;
-
-//     if (nh->pos + 2 > data_end)
-//         return -EACCES;
-//     nh->pos += 2;  // skip "/r/n"
-
-//     bpf_printk("size = %d\n", e->len);
-
-//     if (e->len < 1) {
-//         return -EFAULT;
-//     }
-    
-
-//     if (nh->pos + 1 > data_end) 
-//         return -EACCES;
-    
-//     if (nh->pos + e->len > data_end) 
-//         return -EACCES;
-    
-//     nh->pos += e->len; // skip elem + "/r/n"
-//     e->addr = nh->pos;
-
-//    // bpf_printk("elem[0] = %c\n", *e->addr);
-
-//     return 0;
-// }
 
 static __always_inline int keycmp(const char *k1, const char *k2, void *data_end, int n) {
     unsigned int i;
@@ -233,14 +166,6 @@ static __always_inline void swap_tcpport_src_dst(struct tcphdr *tcph) {
     __be16 tmp = tcph->source;
     tcph->source = tcph->dest;
     tcph->dest = tmp;
-}
-
-static __always_inline __u16 csum_fold_helper(__u32 csum)
-{
-	__u32 sum;
-	sum = (csum >> 16) + (csum & 0xffff);
-	sum += (sum >> 16);
-	return ~sum;
 }
 
 static __always_inline int parse_ethhdr(struct hdr_cursor *nh,
@@ -329,17 +254,21 @@ int xdp_rx_filter(struct xdp_md *ctx) {
     if (parse_tcphdr(&nh, data_end, &tcph))
         goto out;
 
+    // redis-server port
     if (bpf_ntohs(tcph->dest) != 6379)
         goto out;
+
+    DEBUG_PRINTK("message\n%s", (char*)nh.pos);
 
     if ((m = determine_method(&nh, data_end)) == NONE)
         goto out;
 
-    //bpf_printk("message\n%s", (char*)nh.pos);
+    __u16 payload_len = data_end - nh.pos;
 
     // skip " * 3 /r /n $ 3 /r /n [gs] e t /r /n "
-    __u16 payload_len = data_end - nh.pos;
     nh.pos += 13;
+
+    if (nh.pos + 1 > data_end) goto out;
 
     if (nh.pos + 1 > data_end || *(char*)nh.pos++ != '$')
         goto out;
@@ -368,10 +297,10 @@ int xdp_rx_filter(struct xdp_md *ctx) {
                 && !keycmp(key_data, entry->key, data_end, key_len)) {
             bpf_spin_unlock(&entry->lock);
 
-            bpf_printk("GET HIT hook");
+            DEBUG_PRINTK("GET HIT hook.\n");
 
             if (bpf_xdp_adjust_tail(ctx, entry->data_len - payload_len)) {
-                bpf_printk("failed to adjust tail.\n");
+                DEBUG_PRINTK("failed to adjust tail.\n");
                 goto out;
             }
 
@@ -387,53 +316,53 @@ int xdp_rx_filter(struct xdp_md *ctx) {
                 goto out;
 
             char *payload = nh.pos;
-            for (unsigned int off = 0; payload + off + 1 <= data_end && off < entry->data_len && off < 100; off++)
+            for (unsigned int off = 0; payload + off + 1 <= data_end && off < entry->data_len && off < MAX_CACHE_DATA_SIZE; off++)
                 payload[off] = entry->data[off];
             
             swap_mac_src_dst(eth);
             swap_ip4_src_dst(iph);
             swap_tcpport_src_dst(tcph);
 
-            __u16 old_csum = iph->check;
+	        __u16 *pos = (__u16*)iph;
+	        __u32 csum = 0;
+
             iph->check = 0;
-            struct iphdr old_iph = *iph;
             iph->tot_len = bpf_htons((iph->ihl << 2) + (tcph->doff << 2) + entry->data_len);
-            iph->check = csum_fold_helper(bpf_csum_diff((__be32 *)&old_iph, sizeof(struct iphdr), (__be32 *)iph, sizeof(struct iphdr), ~old_csum));
+
+	        for (unsigned int i = 0; i < 10; i++) {
+                csum += *pos;
+		        pos++;
+	        }	
+
+            while (csum >> 16) {
+                csum = (csum & 0xFFFF) + (csum >> 16);
+            }
+
+	        iph->check = (__u16)~csum;
 
             tcph->check = 0;
-            __u32 csum = 0;
+            csum = 0;
 
             __be32 new_seq = tcph->ack_seq;
             tcph->ack_seq = bpf_htonl(bpf_ntohl(tcph->seq) + payload_len);
             tcph->seq = new_seq;
 
             __u32 new_ecr = *(__u32*)(nh.pos - 8);
-            *(__u32*)(nh.pos - 8) = bpf_htonl(bpf_ntohl(*(__u32*)(nh.pos - 4)) + 10000);
+            *(__u32*)(nh.pos - 8) = bpf_htonl(bpf_ntohl(*(__u32*)(nh.pos - 4)) + 100);
             *(__u32*)(nh.pos - 4) = new_ecr;
 
-            struct pseudo_ip p_ip = {
-                .saddr = iph->saddr,
-                .daddr = iph->daddr,
-                .protocol = iph->protocol,
-                .ip_len = bpf_htons(bpf_ntohs(iph->tot_len) - (iph->ihl << 2)),
-            };
-            
-            __u16 *pos = (__u16*)&p_ip;
-            for (unsigned int i = 0; i < sizeof(struct pseudo_ip); i += 2) {
-                csum += *pos;
-                if (csum & 0x80000000)
-                    csum = (csum & 0xFFFF) + (csum >> 16);
-                pos++;
-            }
+            csum += (iph->saddr & 0xFFFF) + (iph->saddr >> 16);
+            csum += (iph->daddr & 0xFFFF) + (iph->daddr >> 16);
+            csum += iph->protocol << 8;
+            csum += bpf_htons(bpf_ntohs(iph->tot_len) - (iph->ihl << 2));
 
             pos = (__u16*)tcph;
             unsigned int i;
-            for (i = 0; pos + 1 <= data_end && i < 130; i++) {
+            for (i = 0; pos + 1 <= data_end && i < MAX_PACKET_LENGTH; i++) {
                 csum += *pos;
-                if (csum & 0x80000000)
-                    csum = (csum & 0xFFFF) + (csum >> 16);
                 pos++;
             }
+
             __u8 *tail = (__u8*)pos;
             if (tail + 1 <= data_end) 
                 csum += *tail;
@@ -445,7 +374,7 @@ int xdp_rx_filter(struct xdp_md *ctx) {
         } else {
             bpf_spin_unlock(&entry->lock);
         }
-        // bpf_printk("GET MISS hook\n");
+        DEBUG_PRINTK("GET MISS hook\n");
 
         struct cache_key key_entry = {
             .hash = key_hash,
@@ -461,11 +390,11 @@ int xdp_rx_filter(struct xdp_md *ctx) {
             goto out;
 
         if (bpf_map_push_elem(&map_invalid_key, &key_entry, BPF_ANY)) {
-            bpf_printk("push failed.\n");
+            DEBUG_PRINTK("push failed.\n");
         }
         break;
     case SET:
-        // bpf_printk("SET hook\n");
+        DEBUG_PRINTK("SET hook\n");
         
         entry = bpf_map_lookup_elem(&map_cache, &cache_idx);
         if (!entry)
@@ -521,15 +450,18 @@ int tc_tx_filter_func(struct __sk_buff *skb) {
         goto out;
 
     char *payload = nh.pos; 
+    DEBUG_PRINTK("tc:\n%s", payload);
     
     if (nh.pos + 1 > data_end || *(char*)nh.pos++ != '$') 
         goto out;
 
     struct cache_key key_entry;
     if (bpf_map_pop_elem(&map_invalid_key, &key_entry)) {
-        bpf_printk("pop failed.\n");
+        DEBUG_PRINTK("pop failed.\n");
         goto out;
     }
+
+    DEBUG_PRINTK("tc: key = '%s'\n", key_entry.data);
     
     int value_len;
     if (strtoi(&nh, data_end, &value_len) || value_len < 0)
@@ -541,7 +473,7 @@ int tc_tx_filter_func(struct __sk_buff *skb) {
     __u32 cache_idx = key_entry.hash % CACHE_ENTRY_COUNT;
     struct cache_entry *entry = bpf_map_lookup_elem(&map_cache, &cache_idx);
     if (!entry) {
-        bpf_printk("cache_entry[%u] not found.\n", cache_idx);
+        DEBUG_PRINTK("cache_entry[%u] not found.\n", cache_idx);
         goto out;
     }
 

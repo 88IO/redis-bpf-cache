@@ -1,6 +1,6 @@
 ifname=$1
 ## init
-# tc qdisc add dev $ifname clsact
+#tc qdisc add dev $ifname clsact
 ## unload 
 tc filter del dev $ifname egress
 ## load
